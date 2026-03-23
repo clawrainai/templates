@@ -49,8 +49,12 @@ MARKET=$(jq -r '.market // empty' "$CONFIG_PATH")
 SERVICE=$(jq -r '.service // "senpi"' "$CONFIG_PATH")
 STRATEGY=$(jq -r '.strategy // empty' "$CONFIG_PATH")
 IDENTITY_ADDRESS=$(jq -r '.identity.address // empty' "$CONFIG_PATH")
-PLATFORM_TOKEN=$(jq -r '.platform.api_token // empty' "$CONFIG_PATH")
-PLATFORM_ENDPOINT=$(jq -r '.platform.endpoint // empty' "$CONFIG_PATH")
+PLATFORM_TOKEN=$(jq -r '.platform_token // .platform.api_token // empty' "$CONFIG_PATH")
+PLATFORM_ENDPOINT=$(jq -r '.platform_endpoint // .platform.endpoint // empty' "$CONFIG_PATH")
+SKILL_REPO=$(jq -r '.skill.repo // empty' "$CONFIG_PATH")
+SKILL_PATH=$(jq -r '.skill.path // empty' "$CONFIG_PATH")
+SKILL_BRANCH=$(jq -r '.skill.branch // "main"' "$CONFIG_PATH")
+PLATFORM_URL=$(jq -r '.platform_url // empty' "$CONFIG_PATH")
 
 [[ -z "$AGENT_ID"  ]] && { log_error "agent_id missing in config"; exit 1; }
 [[ -z "$MARKET"   ]] && { log_error "market missing in config"; exit 1; }
@@ -91,7 +95,7 @@ if [[ "$SERVICE" == "senpi" ]]; then
   log_info "This will generate the agent wallet and configure trading crons."
   echo ""
 
-  if npx --yes senpi-onboard --config "$WORKSPACE_DIR/config.json" 2>&1; then
+  if npx --yes senpi-onboard --config "$WORKSPACE_DIR/setup-config.json" 2>&1; then
     log_info "Senpi onboarding complete!"
   else
     log_warn "Senpi onboarding failed — will retry on first boot"
@@ -100,14 +104,23 @@ fi
 
 # ─── STEP 3: Clone Senpi strategy ───────────────────────────────────────────
 log_info "Fetching strategy from Senpi upstream..."
-git clone --depth 1 "$SENPI_UPSTREAM" "$WORKSPACE_DIR/senpi-registry" 2>/dev/null || {
+
+# Use sparse checkout to only fetch the strategy subdirectory
+SKILL_DIR="$WORKSPACE_DIR/senpi-skill"
+git clone --depth 1 --filter=blob:none --no-checkout "$SKILL_REPO" "$SKILL_DIR" 2>/dev/null || {
   log_error "Failed to clone Senpi upstream"
   exit 1
 }
 
-STRATEGY_DIR="$WORKSPACE_DIR/senpi-registry/$MARKET/$SERVICE/$STRATEGY_KEBAB"
+cd "$SKILL_DIR"
+git sparse-checkout init --cone
+git sparse-checkout set "$SKILL_PATH"
+git checkout main
+cd - > /dev/null
+
+STRATEGY_DIR="$SKILL_DIR/$SKILL_PATH"
 if [[ ! -d "$STRATEGY_DIR" ]]; then
-  log_error "Strategy not found: $MARKET/$SERVICE/$STRATEGY"
+  log_error "Strategy not found: $SKILL_PATH"
   exit 1
 fi
 
@@ -117,7 +130,7 @@ cp -r "$STRATEGY_DIR/skills/"* "$WORKSPACE_DIR/skills/" 2>/dev/null || true
 MEMORY_TPL="$STRATEGY_DIR/memory/template.md"
 [[ -f "$MEMORY_TPL" ]] && cp "$MEMORY_TPL" "$WORKSPACE_DIR/memory/$(date +%Y-%m-%d).md"
 
-rm -rf "$WORKSPACE_DIR/senpi-registry"
+rm -rf "$SKILL_DIR"
 
 # ─── STEP 4: Inject clawrain-agent (metrics server) ────────────────────────────
 log_info "Injecting ClawRain infrastructure..."
