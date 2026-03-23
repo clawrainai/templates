@@ -1,6 +1,5 @@
 #!/bin/bash
-# ClawRain Agent Setup Script v4
- bash -s -- --agent-id AGENT_ID [--api-key KEY]| bash -s -- --agent-id AGENT_ID [--api-key KEY]
+# ClawRain Agent Setup Script — curl ...setup.sh | bash -s -- --agent-id ID
 
 set -e
 
@@ -10,9 +9,9 @@ TEMPLATES_REPO="https://github.com/clawrainai/templates"
 
 # ─── Usage ─────────────────────────────────────────────────────────────────
 usage() {
-  echo "Usage: curl ...setup.sh | bash -s -- --config FILE_OR_URL"
-  echo "  --config FILE_OR_URL   Path or URL to config file (required)"
-  echo "  --workspace DIR         workspace dir (default: ~/.openclaw/workspace)"
+  echo "Usage:"
+  echo "  curl ...setup.sh | bash -s -- --agent-id ID    # from ClawRain Hub API"
+  echo "  curl ...setup.sh | bash -s -- --config FILE   # from downloaded config.json"
   exit 1
 }
 
@@ -23,10 +22,12 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # ─── Args ──────────────────────────────────────────────────────────────────
+AGENT_ID=""
 CONFIG_PATH=""
 WORKSPACE_DIR=""
 while [[ $# -gt 0 ]]; do
   case $1 in
+    --agent-id)  AGENT_ID="$2"; shift 2 ;;
     --config)    CONFIG_PATH="$2"; shift 2 ;;
     --workspace)  WORKSPACE_DIR="$2"; shift 2 ;;
     --help)       usage ;;
@@ -34,18 +35,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$CONFIG_PATH" ]] && { log_error "--config required"; usage; }
+# ─── Config ─────────────────────────────────────────────────────────────────
+# Mode 1: AGENT_ID only (from ClawRain Hub API — config embedded)
+if [[ -n "$AGENT_ID" && -z "$CONFIG_PATH" ]]; then
+  if [[ -z "$CLAWRAIN_CONFIG" ]]; then
+    log_error "No config provided. Use --config or run via the Hub setup URL."
+    usage
+  fi
+  CONFIG_PATH="/tmp/agent-config-$AGENT_ID.json"
+  echo "$CLAWRAIN_CONFIG" | base64 -d > "$CONFIG_PATH"
+  log_info "Config loaded from embedded data"
 
-# ─── Config file ─────────────────────────────────────────────────────────────
-if [[ "$CONFIG_PATH" == http* ]]; then
-  log_info "Fetching config from URL..."
-  TMP="/tmp/agent-config.json"
-  curl -sL "$CONFIG_PATH" -o "$TMP" || { log_error "Failed to download config"; exit 1; }
-  CONFIG_PATH="$TMP"
+# Mode 2: Local config file
+elif [[ -n "$CONFIG_PATH" ]]; then
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    log_error "Config not found: $CONFIG_PATH"
+    usage
+  fi
+  log_info "Config loaded: $CONFIG_PATH"
+  [[ -z "$AGENT_ID" ]] && AGENT_ID=$(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")
+else
+  log_error "--agent-id or --config required"
+  usage
 fi
-[[ ! -f "$CONFIG_PATH" ]] && { log_error "Config not found: $CONFIG_PATH"; usage; }
-log_info "Config loaded: $CONFIG_PATH"
-
 
 # ─── Validate deps ──────────────────────────────────────────────────────────
 command -v jq   &>/dev/null || { log_info "Installing jq..."; sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
@@ -53,7 +65,7 @@ command -v git  &>/dev/null || { log_error "git required"; exit 1; }
 command -v npx  &>/dev/null || { log_error "npx (Node.js) required"; exit 1; }
 
 # ─── Parse config ──────────────────────────────────────────────────────────
-AGENT_ID=$(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")
+[[ -z "$AGENT_ID" ]] && AGENT_ID=$(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")
 [[ -z "$AGENT_ID" ]] && { log_error "agent_id missing in config"; exit 1; }
 
 MARKET=$(jq -r '.market // empty' "$CONFIG_PATH")
