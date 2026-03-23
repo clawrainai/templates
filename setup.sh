@@ -1,7 +1,6 @@
 #!/bin/bash
 # ClawRain Agent Setup Script v4
-# Usage: ./setup.sh --config config.json
-# Or:    curl -fsSL https://raw.githubusercontent.com/clawrainai/templates/main/setup.sh | bash -s -- --config config.json
+ bash -s -- --agent-id AGENT_ID [--api-key KEY]| bash -s -- --agent-id AGENT_ID [--api-key KEY]
 
 set -e
 
@@ -11,9 +10,9 @@ TEMPLATES_REPO="https://github.com/clawrainai/templates"
 
 # ─── Usage ─────────────────────────────────────────────────────────────────
 usage() {
-  echo "Usage: $0 --config config.json [--workspace DIR]"
-  echo "  --config PATH    config.json from ClawRain (required)"
-  echo "  --workspace DIR  workspace dir (default: ~/.openclaw/workspace-{agentId})"
+  echo "Usage: curl ...setup.sh | bash -s -- --config FILE_OR_URL"
+  echo "  --config FILE_OR_URL   Path or URL to config file (required)"
+  echo "  --workspace DIR         workspace dir (default: ~/.openclaw/workspace)"
   exit 1
 }
 
@@ -36,7 +35,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$CONFIG_PATH" ]] && { log_error "--config required"; usage; }
-[[ ! -f "$CONFIG_PATH" ]] && { log_error "Config not found: $CONFIG_PATH"; exit 1; }
+
+# ─── Config file ─────────────────────────────────────────────────────────────
+if [[ "$CONFIG_PATH" == http* ]]; then
+  log_info "Fetching config from URL..."
+  TMP="/tmp/agent-config.json"
+  curl -sL "$CONFIG_PATH" -o "$TMP" || { log_error "Failed to download config"; exit 1; }
+  CONFIG_PATH="$TMP"
+fi
+[[ ! -f "$CONFIG_PATH" ]] && { log_error "Config not found: $CONFIG_PATH"; usage; }
+log_info "Config loaded: $CONFIG_PATH"
+
 
 # ─── Validate deps ──────────────────────────────────────────────────────────
 command -v jq   &>/dev/null || { log_info "Installing jq..."; sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
@@ -45,29 +54,29 @@ command -v npx  &>/dev/null || { log_error "npx (Node.js) required"; exit 1; }
 
 # ─── Parse config ──────────────────────────────────────────────────────────
 AGENT_ID=$(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")
+[[ -z "$AGENT_ID" ]] && { log_error "agent_id missing in config"; exit 1; }
+
 MARKET=$(jq -r '.market // empty' "$CONFIG_PATH")
 SERVICE=$(jq -r '.service // "senpi"' "$CONFIG_PATH")
 STRATEGY=$(jq -r '.strategy // empty' "$CONFIG_PATH")
 IDENTITY_ADDRESS=$(jq -r '.identity.address // empty' "$CONFIG_PATH")
-PLATFORM_TOKEN=$(jq -r '.platform_token // .platform.api_token // empty' "$CONFIG_PATH")
-PLATFORM_ENDPOINT=$(jq -r '.platform_endpoint // .platform.endpoint // empty' "$CONFIG_PATH")
 SKILL_REPO=$(jq -r '.skill.repo // empty' "$CONFIG_PATH")
 SKILL_PATH=$(jq -r '.skill.path // empty' "$CONFIG_PATH")
 SKILL_BRANCH=$(jq -r '.skill.branch // "main"' "$CONFIG_PATH")
 PLATFORM_URL=$(jq -r '.platform_url // empty' "$CONFIG_PATH")
 
-[[ -z "$AGENT_ID"  ]] && { log_error "agent_id missing in config"; exit 1; }
+
 [[ -z "$MARKET"   ]] && { log_error "market missing in config"; exit 1; }
 [[ -z "$STRATEGY" ]] && { log_error "strategy missing in config"; exit 1; }
 
 STRATEGY_KEBAB=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr '.' '-')
 
 # ─── Workspace ─────────────────────────────────────────────────────────────
-WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace-$AGENT_ID}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
 
 log_info "ClawRain Agent Setup v4"
 echo "========================================"
-echo "  Agent ID:   $AGENT_ID"
+echo "  Agent ID:   $(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")"
 echo "  Market:     $MARKET"
 echo "  Strategy:   $STRATEGY"
 echo "  Workspace:  $WORKSPACE_DIR"
