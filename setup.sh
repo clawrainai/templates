@@ -82,8 +82,8 @@ mkdir -p "$HOME/.config/clawrain"
 
 # ─── STEP 1: Install config ─────────────────────────────────────────────────
 log_info "Installing config..."
-cp "$CONFIG_PATH" "$WORKSPACE_DIR/config.json"
-chmod 444 "$WORKSPACE_DIR/config.json"
+cp "$CONFIG_PATH" "$WORKSPACE_DIR/setup-config.json"
+chmod 444 "$WORKSPACE_DIR/setup-config.json"
 
 # ─── STEP 2: Onboard Senpi FIRST — generates wallet + crons ─────────────────
 if [[ "$SERVICE" == "senpi" ]]; then
@@ -119,24 +119,23 @@ MEMORY_TPL="$STRATEGY_DIR/memory/template.md"
 
 rm -rf "$WORKSPACE_DIR/senpi-registry"
 
-# ─── STEP 4: Inject ClawRain infrastructure (platform-push) ─────────────────
+# ─── STEP 4: Inject clawrain-agent (metrics server) ────────────────────────────
 log_info "Injecting ClawRain infrastructure..."
 
-# Shallow clone templates, sparse checkout base/skills
 git clone --depth 1 --filter=blob:none --sparse "$TEMPLATES_REPO" \
   "$WORKSPACE_DIR/templates" 2>/dev/null
 
-if git -C "$WORKSPACE_DIR/templates" sparse-checkout set base/skills 2>/dev/null; then
+if git -C "$WORKSPACE_DIR/templates" sparse-checkout set base 2>/dev/null; then
   : # ok
 else
   git -C "$WORKSPACE_DIR/templates" sparse-checkout init 2>/dev/null
-  git -C "$WORKSPACE_DIR/templates" sparse-checkout set base/skills 2>/dev/null
+  git -C "$WORKSPACE_DIR/templates" sparse-checkout set base 2>/dev/null
 fi
 
-# Copy platform-push
-if [[ -d "$WORKSPACE_DIR/templates/base/skills/platform-push" ]]; then
-  cp -r "$WORKSPACE_DIR/templates/base/skills/platform-push" "$WORKSPACE_DIR/skills/"
-  log_info "platform-push installed"
+if [[ -d "$WORKSPACE_DIR/templates/base/clawrain-agent" ]]; then
+  mkdir -p "$WORKSPACE_DIR/clawrain-agent"
+  cp -r "$WORKSPACE_DIR/templates/base/clawrain-agent/"* "$WORKSPACE_DIR/clawrain-agent/"
+  log_info "clawrain-agent installed"
 fi
 
 # Copy base OpenClaw files
@@ -177,13 +176,32 @@ if [[ -n "$PLATFORM_TOKEN" && -n "$PLATFORM_ENDPOINT" ]]; then
     || log_warn "Could not register with platform"
 fi
 
-# ─── STEP 7: Start platform-push in background ──────────────────────────────
-if [[ -f "$WORKSPACE_DIR/skills/platform-push/platform-push.js" ]]; then
-  log_info "Starting platform-push..."
-  nohup node "$WORKSPACE_DIR/skills/platform-push/platform-push.js" \
-    >> /tmp/clawrain-push-$AGENT_ID.log 2>&1 &
-  echo $! > "$HOME/.config/clawrain/platform-push.pid"
-  log_info "platform-push running (PID $(cat $HOME/.config/clawrain/platform-push.pid))"
+# ─── STEP 7: Install + start clawrain-agent ───────────────────────────────
+if [[ -f "$WORKSPACE_DIR/clawrain-agent/clawrain_agent-0.1.0.tar.gz" ]]; then
+  log_info "Installing clawrain-agent..."
+
+  # Install Python dependencies
+  pip install fastapi uvicorn[standard] python-multipart aiofiles httpx \
+    --quiet 2>/dev/null || true
+
+  # Install clawrain-agent from local tarball
+  pip install "$WORKSPACE_DIR/clawrain-agent/clawrain_agent-0.1.0.tar.gz" \
+    --quiet 2>/dev/null || {
+    log_warn "clawrain-agent install failed — trying from PyPI"
+    pip install clawrain-agent --quiet 2>/dev/null || true
+  }
+
+  if command -v clawrain-agent &>/dev/null; then
+    log_info "Starting clawrain-agent on port 8000..."
+    clawrain-agent init --config "$WORKSPACE_DIR/setup-config.json" 2>/dev/null || true
+    nohup clawrain-agent start --config "$WORKSPACE_DIR/setup-config.json" --port 8000 \
+      >> /tmp/clawrain-agent-$AGENT_ID.log 2>&1 &
+    echo $! > "$HOME/.config/clawrain/agent.pid"
+    log_info "clawrain-agent running (PID $(cat $HOME/.config/clawrain/agent.pid))"
+    log_info "Metrics API: http://localhost:8000"
+  else
+    log_warn "clawrain-agent not available — metrics will not be served"
+  fi
 fi
 
 # ─── STEP 8: Create start script ───────────────────────────────────────────
