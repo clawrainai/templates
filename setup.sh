@@ -105,6 +105,13 @@ echo ""
 command -v jq     &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
 command -v git    &>/dev/null || { log_error "git required"; exit 1; }
 command -v node   &>/dev/null || { log_error "node (Node.js) required"; exit 1; }
+
+# ─── Ensure Node.js dependencies ───────────────────────────────────────────
+# ethers is required for wallet generation
+if ! node -e "require('ethers')" 2>/dev/null; then
+  log_info "Installing ethers@6 (required for wallet generation)..."
+  npm install -g ethers@6 --quiet 2>/dev/null || npm install -g ethers@6
+fi
 command -v mcporter &>/dev/null && MC_PORTER=true || MC_PORTER=false
 
 # ─── STEP 1: Create workspace ──────────────────────────────────────────────
@@ -157,27 +164,38 @@ log_done "Strategy installed"
 log_step "STEP 4: Generating wallet..."
 
 WALLET_SCRIPT="$SENPI_TMP/senpi-onboard/scripts/generate_wallet.js"
+WALLET_DATA=""
 if [[ -f "$WALLET_SCRIPT" ]]; then
-  WALLET_DATA=$(node "$WALLET_SCRIPT" 2>/dev/null) || {
-    WALLET_DATA=$(node -e "
-      const { ethers } = require('ethers');
-      const w = ethers.Wallet.createRandom();
-      console.log(JSON.stringify({
-        address: w.address,
-        privateKey: w.privateKey,
-        mnemonic: w.mnemonic.phrase
-      }));
-    " 2>/dev/null)
-  }
-  
-  if [[ -n "$WALLET_DATA" ]]; then
-    WALLET_ADDR=$(echo "$WALLET_DATA" | jq -r '.address')
-    echo "$WALLET_DATA" > "$SENPI_WALLET"
-    chmod 600 "$SENPI_WALLET"
-    log_done "Wallet: ${WALLET_ADDR:0:10}...${WALLET_ADDR: -6}"
-  fi
+  # Try with NODE_PATH if ethers is installed globally
+  WALLET_DATA=$(NODE_PATH=$(npm root -g) node "$WALLET_SCRIPT" 2>/dev/null)
+fi
+
+if [[ -z "$WALLET_DATA" ]]; then
+  # Try inline with global ethers
+  WALLET_DATA=$(NODE_PATH=$(npm root -g) node -e "
+    const { ethers } = require('ethers');
+    const w = ethers.Wallet.createRandom();
+    console.log(JSON.stringify({ address: w.address, privateKey: w.privateKey, mnemonic: w.mnemonic.phrase }));
+  " 2>/dev/null)
+fi
+
+if [[ -z "$WALLET_DATA" ]]; then
+  # Last resort: use npx
+  WALLET_DATA=$(npx -y -p ethers@6 node -e "
+    const { ethers } = require('ethers');
+    const w = ethers.Wallet.createRandom();
+    console.log(JSON.stringify({ address: w.address, privateKey: w.privateKey, mnemonic: w.mnemonic.phrase }));
+  " 2>/dev/null)
+fi
+
+if [[ -n "$WALLET_DATA" ]]; then
+  WALLET_ADDR=$(echo "$WALLET_DATA" | jq -r '.address')
+  echo "$WALLET_DATA" > "$SENPI_WALLET"
+  chmod 600 "$SENPI_WALLET"
+  log_done "Wallet: ${WALLET_ADDR:0:10}...${WALLET_ADDR: -6}"
 else
-  log_warn "Wallet script not found"
+  log_error "Wallet generation failed — no ethers available"
+  log_error "Please install: npm install -g ethers@6"
 fi
 
 # ─── STEP 5: Register with Senpi ───────────────────────────────────────────
