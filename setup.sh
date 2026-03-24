@@ -1,18 +1,22 @@
 #!/bin/bash
-# ClawRain Agent Setup Script v6
-# Architecture: OpenClaw + Senpi MCP (no Python agent)
+# ClawRain Agent Setup Script v7
+# Architecture: OpenClaw + Senpi MCP
+# - Each strategy has its own ~/.config/senpi/ (credentials, wallet, state)
+# - Optional --start flag with systemd service
 # 
 # Usage:
-#   curl ...setup.sh | bash -s -- --agent-id ID --strategy POLAR
+#   curl ...setup.sh | bash -s -- --agent-id ID
+#   curl ...setup.sh | bash -s -- --agent-id ID --start
 
 set -e
 
 # ─── Colors ─────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${BLUE}[STEP]${NC} $1"; }
+log_done()  { echo -e "${CYAN}[DONE]${NC} $1"; }
 
 # ─── Repos ─────────────────────────────────────────────────────────────────
 SENPI_UPSTREAM="https://github.com/Senpi-ai/senpi-skills"
@@ -20,42 +24,43 @@ SENPI_MCP_ENDPOINT="https://mcp.prod.senpi.ai"
 
 usage() {
   echo "Usage:"
-  echo "  curl ...setup.sh | bash -s -- --agent-id ID --strategy POLAR"
+  echo "  curl ...setup.sh | bash -s -- --agent-id ID"
+  echo "  curl ...setup.sh | bash -s -- --agent-id ID --start"
   echo ""
-  echo "Required:"
-  echo "  --agent-id      ClawRain agent UUID"
-  echo "  --strategy      Strategy name (POLAR, FOX, ORCA, etc.)"
-  echo ""
-  echo "Optional:"
-  echo "  --workspace     Workspace directory (default: auto)"
-  echo "  --identity      Identity type: telegram, wallet, or agent (default: agent)"
+  echo "Options:"
+  echo "  --agent-id      ClawRain agent UUID (required)"
+  echo "  --start         Auto-start the agent after setup"
+  echo "  --workspace     Custom workspace directory"
+  echo "  --identity      Identity: telegram, wallet, or agent (default: agent)"
   echo "  --identity-val  Identity value (@username or 0x address)"
   exit 1
 }
 
 # ─── Args ──────────────────────────────────────────────────────────────────
 AGENT_ID=""
-STRATEGY=""
+AUTO_START=false
 WORKSPACE_DIR=""
-IDENTITY_TYPE="agent"  # agent = generate wallet
+IDENTITY_TYPE="agent"
 IDENTITY_VALUE=""
+STARTUP_TOKEN=""  # Token for auto-start via systemd
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --agent-id)    AGENT_ID="$2";    shift 2 ;;
-    --strategy)    STRATEGY="$2";    shift 2 ;;
-    --workspace)   WORKSPACE_DIR="$2"; shift 2 ;;
-    --identity)    IDENTITY_TYPE="$2"; shift 2 ;;
+    --agent-id)     AGENT_ID="$2";      shift 2 ;;
+    --start)        AUTO_START=true;     shift ;;
+    --workspace)    WORKSPACE_DIR="$2";   shift 2 ;;
+    --identity)     IDENTITY_TYPE="$2";   shift 2 ;;
     --identity-val) IDENTITY_VALUE="$2"; shift 2 ;;
-    --help)        usage ;;
-    *)             log_error "Unknown: $1"; usage ;;
+    --startup-token) STARTUP_TOKEN="$2";  shift 2 ;;
+    --help)         usage ;;
+    *)              log_error "Unknown: $1"; usage ;;
   esac
 done
 
-# ─── Validate ID only ─────────────────────────────────────────────────────────
-[[ -z "$AGENT_ID" ]]   && { log_error "--agent-id required"; usage; }
+# ─── Validate ──────────────────────────────────────────────────────────────
+[[ -z "$AGENT_ID" ]] && { log_error "--agent-id required"; usage; }
 
-# ─── Load config from CLAWRAIN_CONFIG (embedded JSON) ───────────────────────
+# ─── Load config ──────────────────────────────────────────────────────────
 if [[ -z "$CLAWRAIN_CONFIG" ]]; then
   log_error "CLAWRAIN_CONFIG env var not set. Run via Hub API URL."
   exit 1
@@ -64,83 +69,81 @@ fi
 CONFIG_PATH="/tmp/agent-config-$AGENT_ID.json"
 echo "$CLAWRAIN_CONFIG" | base64 -d > "$CONFIG_PATH"
 
-# Parse embedded config
 PLATFORM_URL=$(jq -r '.platform_url // empty' "$CONFIG_PATH")
 PLATFORM_TOKEN=$(jq -r '.platform_token // empty' "$CONFIG_PATH")
 PLATFORM_ENDPOINT=$(jq -r '.platform_endpoint // empty' "$CONFIG_PATH")
 SKILL_REPO=$(jq -r '.skill.repo // "https://github.com/Senpi-ai/senpi-skills"' "$CONFIG_PATH")
 SKILL_PATH=$(jq -r '.skill.path // empty' "$CONFIG_PATH")
 SKILL_BRANCH=$(jq -r '.skill.branch // "main"' "$CONFIG_PATH")
-STRATEGY="${STRATEGY:-$(basename "$SKILL_PATH")}"  # Use arg or derive from config
+STRATEGY=$(basename "$SKILL_PATH")
 
-# Validate strategy
-[[ -z "$STRATEGY" ]] && { log_error "strategy not found in config or --strategy arg"; usage; }
+[[ -z "$STRATEGY" ]] && { log_error "strategy not found in config"; exit 1; }
 
 STRATEGY_KEBAB=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]')
 STRATEGY_UPPER=$(echo "$STRATEGY" | tr '[:lower:]' '[:upper:]')
 
 # ─── Workspace ─────────────────────────────────────────────────────────────
+# Each strategy has its own workspace, and its own ~/.config/senpi inside it
 WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace/hyperliquid/senpi/$STRATEGY_KEBAB}"
 
-log_info "ClawRain Agent Setup v6"
+# Per-strategy Senpi config (in workspace, not shared)
+SENPI_CONFIG_DIR="$WORKSPACE_DIR/.config/senpi"
+SENPI_CREDS="$SENPI_CONFIG_DIR/credentials.json"
+SENPI_WALLET="$SENPI_CONFIG_DIR/wallet.json"
+SENPI_STATE="$SENPI_CONFIG_DIR/state.json"
+
+log_info "ClawRain Agent Setup v7"
 log_info "Strategy: $STRATEGY_UPPER"
 echo "========================================"
 echo "  Agent ID:   $AGENT_ID"
 echo "  Strategy:   $STRATEGY_UPPER"
 echo "  Workspace:  $WORKSPACE_DIR"
+echo "  Auto-start: $AUTO_START"
 echo ""
 
 # ─── Validate deps ──────────────────────────────────────────────────────────
 command -v jq     &>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
 command -v git    &>/dev/null || { log_error "git required"; exit 1; }
-command -v node  &>/dev/null || { log_error "node (Node.js) required"; exit 1; }
+command -v node   &>/dev/null || { log_error "node (Node.js) required"; exit 1; }
 command -v mcporter &>/dev/null && MC_PORTER=true || MC_PORTER=false
 
-# ─── STEP 1: Create workspace structure ─────────────────────────────────────
-log_step "STEP 1: Creating workspace structure..."
+# ─── STEP 1: Create workspace ──────────────────────────────────────────────
+log_step "STEP 1: Creating workspace..."
 
 mkdir -p "$WORKSPACE_DIR"/{skills,scripts,memory}
-mkdir -p "$HOME/.config/senpi"
+mkdir -p "$SENPI_CONFIG_DIR"
 mkdir -p "$HOME/.openclaw/workspace/config"
 
-log_info "Workspace: $WORKSPACE_DIR"
+log_done "Workspace: $WORKSPACE_DIR"
 
 # ─── STEP 2: Clone senpi-skills ────────────────────────────────────────────
-log_step "STEP 2: Cloning Senpi skills repository..."
+log_step "STEP 2: Cloning Senpi skills..."
 
 SENPI_TMP="/tmp/senpi-skills-$AGENT_ID"
-
-if [[ -d "$SENPI_TMP" ]]; then
-  log_info "Using cached senpi-skills..."
-else
+if [[ ! -d "$SENPI_TMP" ]]; then
   git clone --depth 1 "$SKILL_REPO" "$SENPI_TMP" 2>/dev/null || {
     log_error "Failed to clone $SKILL_REPO"
     exit 1
   }
 fi
 
-log_info "Senpi skills cloned"
+log_done "Senpi skills cloned"
 
-# ─── STEP 3: Verify strategy exists ─────────────────────────────────────────
-log_step "STEP 3: Verifying strategy '$STRATEGY_UPPER'..."
+# ─── STEP 3: Copy strategy ─────────────────────────────────────────────────
+log_step "STEP 3: Installing strategy '$STRATEGY_UPPER'..."
 
 STRATEGY_PATH="$SENPI_TMP/$SKILL_PATH"
 if [[ ! -d "$STRATEGY_PATH" ]]; then
   log_error "Strategy not found at '$SKILL_PATH'"
-  log_info "Available strategies:"
-  ls -d "$SENPI_TMP"/*/ 2>/dev/null | xargs -I{} basename {} | grep -v "senpi-\|dsl-\|emerging\|fee\|opportunity" | head -20
-  rm -rf "$SENPI_TMP"
+  ls "$SENPI_TMP" | grep -v "senpi-\|dsl-\|\.md\|LICENSE" | head -20
   exit 1
 fi
 
-# Copy strategy into workspace
 cp -r "$STRATEGY_PATH"/skills/* "$WORKSPACE_DIR/skills/" 2>/dev/null || true
 cp "$STRATEGY_PATH"/*.md "$WORKSPACE_DIR/" 2>/dev/null || true
 cp "$STRATEGY_PATH"/*.json "$WORKSPACE_DIR/" 2>/dev/null || true
 
-log_info "Strategy copied: $STRATEGY_PATH"
-
-# Copy shared plugins (DSL, fee optimizer, etc.)
+# Copy shared plugins
 for plugin in dsl-dynamic-stop-loss fee-optimizer emerging-movers opportunity-scanner; do
   if [[ -d "$SENPI_TMP/$plugin/skills" ]]; then
     mkdir -p "$WORKSPACE_DIR/skills/$plugin"
@@ -148,13 +151,14 @@ for plugin in dsl-dynamic-stop-loss fee-optimizer emerging-movers opportunity-sc
   fi
 done
 
+log_done "Strategy installed"
+
 # ─── STEP 4: Generate wallet ───────────────────────────────────────────────
-log_step "STEP 4: Generating trading wallet..."
+log_step "STEP 4: Generating wallet..."
 
 WALLET_SCRIPT="$SENPI_TMP/senpi-onboard/scripts/generate_wallet.js"
 if [[ -f "$WALLET_SCRIPT" ]]; then
   WALLET_DATA=$(node "$WALLET_SCRIPT" 2>/dev/null) || {
-    # Fallback inline generation
     WALLET_DATA=$(node -e "
       const { ethers } = require('ethers');
       const w = ethers.Wallet.createRandom();
@@ -168,22 +172,21 @@ if [[ -f "$WALLET_SCRIPT" ]]; then
   
   if [[ -n "$WALLET_DATA" ]]; then
     WALLET_ADDR=$(echo "$WALLET_DATA" | jq -r '.address')
-    echo "$WALLET_DATA" > "$HOME/.config/senpi/wallet.json"
-    chmod 600 "$HOME/.config/senpi/wallet.json"
-    log_info "Wallet generated: ${WALLET_ADDR:0:10}...${WALLET_ADDR: -6}"
+    echo "$WALLET_DATA" > "$SENPI_WALLET"
+    chmod 600 "$SENPI_WALLET"
+    log_done "Wallet: ${WALLET_ADDR:0:10}...${WALLET_ADDR: -6}"
   fi
 else
-  log_warn "Wallet generation script not found"
+  log_warn "Wallet script not found"
 fi
 
-# ─── STEP 5: Senpi onboarding (API registration) ────────────────────────────
+# ─── STEP 5: Register with Senpi ───────────────────────────────────────────
 log_step "STEP 5: Registering with Senpi..."
 
-# Prepare identity
 case "$IDENTITY_TYPE" in
   telegram)
     IDENTITY_FROM="TELEGRAM"
-    IDENTITY_SUBJECT="${IDENTITY_VALUE#@}"  # strip @
+    IDENTITY_SUBJECT="${IDENTITY_VALUE#@}"
     ;;
   wallet)
     IDENTITY_FROM="WALLET"
@@ -191,16 +194,10 @@ case "$IDENTITY_TYPE" in
     ;;
   agent|*)
     IDENTITY_FROM="WALLET"
-    IDENTITY_SUBJECT="${WALLET_ADDR:-$(cat $HOME/.config/senpi/wallet.json 2>/dev/null | jq -r '.address')}"
+    IDENTITY_SUBJECT="${WALLET_ADDR:-$(cat $SENPI_WALLET 2>/dev/null | jq -r '.address')}"
     ;;
 esac
 
-if [[ -z "$IDENTITY_SUBJECT" ]]; then
-  log_error "Could not determine identity. Provide --identity wallet --identity-val 0x..."
-  exit 1
-fi
-
-# Call Senpi GraphQL API
 RESPONSE=$(curl -s -X POST https://moxie-backend.prod.senpi.ai/graphql \
   -H "Content-Type: application/json" \
   -d '{
@@ -215,113 +212,87 @@ RESPONSE=$(curl -s -X POST https://moxie-backend.prod.senpi.ai/graphql \
     }
   }')
 
-# Parse response
 if echo "$RESPONSE" | jq -e '.data.CreateAgentStubAccount.apiKey' >/dev/null 2>&1; then
   SENPI_API_KEY=$(echo "$RESPONSE" | jq -r '.data.CreateAgentStubAccount.apiKey')
   SENPI_USER_ID=$(echo "$RESPONSE" | jq -r '.data.CreateAgentStubAccount.user.id')
   SENPI_REFERRAL=$(echo "$RESPONSE" | jq -r '.data.CreateAgentStubAccount.user.referralCode')
-  SENPI_WALLET=$(echo "$RESPONSE" | jq -r '.data.CreateAgentStubAccount.agentWalletAddress')
+  SENPI_WALLET_ADDR=$(echo "$RESPONSE" | jq -r '.data.CreateAgentStubAccount.agentWalletAddress')
   
-  log_info "Senpi account created!"
-  log_info "  User ID: $SENPI_USER_ID"
-  log_info "  Referral: $SENPI_REFERRAL"
-  
-  # Save credentials
-  cat > "$HOME/.config/senpi/credentials.json" << EOF
+  cat > "$SENPI_CREDS" << EOF
 {
   "apiKey": "$SENPI_API_KEY",
   "userId": "$SENPI_USER_ID",
   "referralCode": "$SENPI_REFERRAL",
-  "agentWalletAddress": "$SENPI_WALLET",
+  "agentWalletAddress": "$SENPI_WALLET_ADDR",
   "onboardedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "onboardedVia": "$IDENTITY_FROM",
   "subject": "$IDENTITY_SUBJECT"
 }
 EOF
-  chmod 600 "$HOME/.config/senpi/credentials.json"
+  chmod 600 "$SENPI_CREDS"
+  
+  log_done "Senpi registered: User $SENPI_USER_ID"
 else
-  log_warn "Senpi API registration failed: $(echo "$RESPONSE" | jq -r '.errors[0].message' 2>/dev/null || echo 'unknown error')"
-  log_warn "Continuing anyway — manual registration possible later"
+  log_warn "Senpi API registration failed"
+  SENPI_API_KEY=""
+  SENPI_USER_ID="unknown"
+  SENPI_REFERRAL=""
 fi
 
-# ─── STEP 6: Configure MCP server via mcporter ──────────────────────────────
-log_step "STEP 6: Configuring Senpi MCP server..."
+# ─── STEP 6: Configure MCP ─────────────────────────────────────────────────
+log_step "STEP 6: Configuring Senpi MCP..."
 
 if $MC_PORTER && [[ -n "$SENPI_API_KEY" ]]; then
-  log_info "Configuring mcporter for Senpi MCP..."
-  
-  mcporter config add senpi --command npx \
-    --persist "$HOME/.openclaw/workspace/config/mcporter.json" \
+  mcporter config add senpi-$STRATEGY_KEBAB --command npx \
+    --persist "$HOME/.openclaw/workspace/config/mcporter-$STRATEGY_KEBAB.json" \
     --env "SENPI_AUTH_TOKEN=${SENPI_API_KEY}" \
     -- mcp-remote "${SENPI_MCP_ENDPOINT}/mcp" \
     --header "Authorization: Bearer \${SENPI_AUTH_TOKEN}" 2>/dev/null || {
-    log_warn "mcporter config failed — will use manual .mcp.json"
-    $MC_PORTER=false
+    log_warn "mcporter failed, using .mcp.json"
+    MC_PORTER=false
   }
 fi
 
 if ! $MC_PORTER; then
-  log_info "Configuring via .mcp.json..."
-  mkdir -p "$WORKSPACE_DIR"
   cat > "$WORKSPACE_DIR/.mcp.json" << EOF
 {
   "mcpServers": {
     "senpi": {
       "command": "npx",
-      "args": [
-        "mcp-remote",
-        "${SENPI_MCP_ENDPOINT}/mcp",
-        "--header",
-        "Authorization: Bearer \${SENPI_AUTH_TOKEN}"
-      ],
-      "env": {
-        "SENPI_AUTH_TOKEN": "${SENPI_API_KEY}"
-      }
+      "args": ["mcp-remote", "${SENPI_MCP_ENDPOINT}/mcp", "--header", "Authorization: Bearer \${SENPI_AUTH_TOKEN}"],
+      "env": { "SENPI_AUTH_TOKEN": "${SENPI_API_KEY}" }
     }
   }
 }
 EOF
 fi
 
-log_info "MCP configured"
+log_done "MCP configured"
 
-# ─── STEP 7: Create agent identity files ────────────────────────────────────
+# ─── STEP 7: Create identity files ─────────────────────────────────────────
 log_step "STEP 7: Creating agent identity..."
 
-# SOUL.md - agent personality
 cat > "$WORKSPACE_DIR/SOUL.md" << EOF
 # SOUL.md — $STRATEGY_UPPER Trading Agent
 
-I am **$STRATEGY_UPPER**, an autonomous trading agent running on Senpi + Hyperliquid.
+I am **$STRATEGY_UPPER**, an autonomous trading agent powered by Senpi + Hyperliquid.
 
-## My Strategy
+## My Mission
 
-$(cat "$STRATEGY_PATH"/README.md 2>/dev/null | head -30 || echo "Strategy loaded from Senpi skills repository.")
+Execute the $STRATEGY_UPPER strategy with discipline and risk management.
 
-## Core Identity
+## Strategy
 
-- **Role**: Autonomous Crypto Trader
-- **Exchange**: Hyperliquid
+$(cat "$STRATEGY_PATH"/README.md 2>/dev/null | head -50 || echo "See skills/ directory")
+
+## Identity
+
 - **Strategy**: $STRATEGY_UPPER
+- **Exchange**: Hyperliquid
 - **Operator**: ClawRain Hub
-
-## Operational Loop
-
-1. Scan markets using Senpi MCP tools
-2. Evaluate signals per strategy criteria
-3. Execute trades with proper position sizing
-4. Monitor positions with DSL (Dynamic Stop Loss)
-5. Report metrics to ClawRain Hub
-
-## Safety Rules
-
-- Never exceed configured risk parameters
-- Always use DSL for active positions
-- Report every trade to the platform
-- Maintain trading log in memory/
+- **Created**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 
-# AGENTS.md - operational guidelines
 cat > "$WORKSPACE_DIR/AGENTS.md" << 'AGENTS'
 # AGENTS.md
 
@@ -330,81 +301,61 @@ cat > "$WORKSPACE_DIR/AGENTS.md" << 'AGENTS'
 - Decisions in memory/decisions/
 - Lessons in memory/lessons/
 
-## Skills
-- Strategy: skills/$STRATEGY_KEBAB/
-- Plugins: skills/dsl-*/, skills/fee-optimizer/, etc.
-
-## Cron
-- Market scan: every 3 minutes during market hours
-- Portfolio check: every 15 minutes
-- Performance report: daily
-
-## Safety
-- DSL High Water Mode is MANDATORY for all positions
+## Safety Rules
+- DSL High Water Mode is MANDATORY
 - Never trade without stop loss
 - Report all trades to platform
 AGENTS
 
-# IDENTITY.md
 cat > "$WORKSPACE_DIR/IDENTITY.md" << EOF
 # IDENTITY.md
-
 - **Name**: $STRATEGY_UPPER
 - **Type**: Autonomous Trading Agent
 - **Emoji**: 🤖
 - **Created**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 
-log_info "Identity files created"
+log_done "Identity created"
 
-# ─── STEP 8: Create state.json ──────────────────────────────────────────────
-log_step "STEP 8: Initializing Senpi state..."
+# ─── STEP 8: Initialize state ──────────────────────────────────────────────
+log_step "STEP 8: Initializing state..."
 
-cat > "$HOME/.config/senpi/state.json" << EOF
+cat > "$SENPI_STATE" << EOF
 {
   "version": "1.0.0",
   "state": "UNFUNDED",
-  "error": null,
+  "strategy": "$STRATEGY_UPPER",
+  "workspace": "$WORKSPACE_DIR",
   "onboarding": {
-    "step": "COMPLETE",
-    "startedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-    "completedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-    "identityType": "$IDENTITY_FROM",
-    "subject": "$IDENTITY_SUBJECT",
-    "walletGenerated": true
+    "completedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   },
   "account": {
     "userId": "${SENPI_USER_ID:-unknown}",
-    "referralCode": "${SENPI_REFERRAL:-unknown}",
-    "agentWalletAddress": "${SENPI_WALLET:-unknown}"
+    "referralCode": "${SENPI_REFERRAL:-unknown}"
   },
   "wallet": {
     "address": "${WALLET_ADDR:-unknown}",
     "funded": false
-  },
-  "mcp": {
-    "configured": true,
-    "endpoint": "${SENPI_MCP_ENDPOINT}"
   }
 }
 EOF
 
-log_info "State initialized"
+log_done "State initialized"
 
 # ─── STEP 9: Create start script ────────────────────────────────────────────
 log_step "STEP 9: Creating start script..."
 
-SENPI_CREDS="$HOME/.config/senpi/credentials.json"
-SENPI_WALLET_FILE="$HOME/.config/senpi/wallet.json"
-
 cat > "$WORKSPACE_DIR/start.sh" << 'STARTSCRIPT'
 #!/bin/bash
-# Start script for ClawRain trading agent
-
 AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_NAME="$(basename "$AGENT_DIR")"
-SENPI_CREDS="$HOME/.config/senpi/credentials.json"
-SENPI_WALLET="$HOME/.config/senpi/wallet.json"
+
+# Load Senpi credentials for this strategy
+SENPI_CONFIG="$AGENT_DIR/.config/senpi"
+source "$SENPI_CONFIG/credentials.json" 2>/dev/null || true
+
+export SENPI_AUTH_TOKEN="${apiKey:-}"
+export SENPI_API_KEY="${apiKey:-}"
 
 echo "========================================"
 echo "  ClawRain Agent: $AGENT_NAME"
@@ -412,15 +363,11 @@ echo "  Workspace: $AGENT_DIR"
 echo "  Started: $(date)"
 echo "========================================"
 
-# Check credentials
-if [[ ! -f "$SENPI_CREDS" ]]; then
-  echo "ERROR: Senpi credentials not found at $SENPI_CREDS"
-  echo "Run onboarding first."
+# Verify credentials exist
+if [[ ! -f "$SENPI_CONFIG/credentials.json" ]]; then
+  echo "ERROR: Senpi credentials not found"
   exit 1
 fi
-
-# Load API key for MCP
-export SENPI_AUTH_TOKEN=$(cat "$SENPI_CREDS" | jq -r '.apiKey')
 
 # Start OpenClaw agent
 cd "$AGENT_DIR"
@@ -429,21 +376,68 @@ STARTSCRIPT
 
 chmod +x "$WORKSPACE_DIR/start.sh"
 
-# ─── STEP 10: Register with platform ───────────────────────────────────────
+log_done "Start script created"
+
+# ─── STEP 10: Create systemd service (auto-start) ───────────────────────────
+if [[ "$AUTO_START" == "true" ]]; then
+  log_step "STEP 10: Creating systemd service..."
+  
+  SYSTEMD_UNIT="$HOME/.config/systemd/user/clawrain-$STRATEGY_KEBAB.service"
+  mkdir -p "$(dirname "$SYSTEMD_UNIT")"
+  
+  cat > "$SYSTEMD_UNIT" << EOF
+[Unit]
+Description=ClawRain $STRATEGY_UPPER Agent
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$WORKSPACE_DIR
+Environment="SENPI_AUTH_TOKEN=$(cat $SENPI_CREDS 2>/dev/null | jq -r '.apiKey')"
+ExecStart=$WORKSPACE_DIR/start.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+  # Enable lingering for non-login users
+  log-done "Systemd service created"
+fi
+
+# ─── STEP 11: Register with platform ───────────────────────────────────────
 if [[ -n "$PLATFORM_TOKEN" && -n "$PLATFORM_ENDPOINT" ]]; then
-  log_step "STEP 10: Registering with ClawRain platform..."
+  log_step "STEP 11: Registering with platform..."
   
   curl -s -X POST "$PLATFORM_ENDPOINT/rest/v1/agent_metrics" \
     -H "Authorization: Bearer $PLATFORM_TOKEN" \
+    -H "apikey: $PLATFORM_TOKEN" \
     -H "Content-Type: application/json" \
     -H "Prefer: return=minimal" \
     -d "{\"agent_id\":\"$AGENT_ID\",\"strategy\":\"$STRATEGY_UPPER\",\"status\":\"provisioned\",\"equity\":0,\"pnl_total\":0}" \
-    || log_warn "Could not register with platform"
+    || log_warn "Platform registration failed"
 fi
 
 # ─── Cleanup ────────────────────────────────────────────────────────────────
 rm -rf "$SENPI_TMP"
 rm -f "$CONFIG_PATH"
+
+# ─── Auto-start if requested ──────────────────────────────────────────────
+if [[ "$AUTO_START" == "true" ]]; then
+  log_step "STARTING: Agent $STRATEGY_UPPER..."
+  
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable clawrain-$STRATEGY_KEBAB 2>/dev/null || true
+  systemctl --user start clawrain-$STRATEGY_KEBAB 2>/dev/null || true
+  
+  sleep 2
+  if systemctl --user is-active --quiet clawrain-$STRATEGY_KEBAB 2>/dev/null; then
+    log_done "Agent $STRATEGY_UPPER is running!"
+  else
+    log_warn "Could not verify agent status"
+  fi
+fi
 
 # ─── DONE ──────────────────────────────────────────────────────────────────
 echo ""
@@ -455,9 +449,11 @@ echo "  Strategy:   $STRATEGY_UPPER"
 echo "  Workspace:  $WORKSPACE_DIR"
 echo "  Wallet:     ${WALLET_ADDR:0:10}...${WALLET_ADDR: -6}"
 echo ""
-echo "Next steps:"
-echo "  1. Fund wallet: ${SENPI_WALLET:-$HOME/.config/senpi/wallet.json}"
-echo "  2. Run: $WORKSPACE_DIR/start.sh"
+echo "Next step:"
+echo "  Fund wallet: ${WALLET_ADDR:-unknown}"
 echo ""
-echo "Senpi referral: https://senpi.ai/skill.md?ref=${SENPI_REFERRAL:-}"
+if [[ "$AUTO_START" != "true" ]]; then
+  echo "  To start:   $WORKSPACE_DIR/start.sh"
+  echo "  To auto-start: re-run with --start flag"
+fi
 echo ""
