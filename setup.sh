@@ -421,7 +421,7 @@ WantedBy=default.target
 EOF
 
   # Enable lingering for non-login users
-  log-done "Systemd service created"
+  log_done "Systemd service created"
 fi
 
 # ─── STEP 11: Register with platform ───────────────────────────────────────
