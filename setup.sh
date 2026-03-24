@@ -84,7 +84,7 @@ STRATEGY_UPPER=$(echo "$STRATEGY" | tr '[:lower:]' '[:upper:]')
 
 # ─── Workspace ─────────────────────────────────────────────────────────────
 # Each strategy has its own workspace, and its own ~/.config/senpi inside it
-WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace/hyperliquid/senpi/$STRATEGY_KEBAB}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace/clawrain/hyperliquid/senpi/$STRATEGY_KEBAB}"
 
 # Per-strategy Senpi config (in workspace, not shared)
 SENPI_CONFIG_DIR="$WORKSPACE_DIR/.config/senpi"
