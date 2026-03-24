@@ -146,9 +146,13 @@ if [[ ! -d "$STRATEGY_PATH" ]]; then
   exit 1
 fi
 
-cp -r "$STRATEGY_PATH"/skills/* "$WORKSPACE_DIR/skills/" 2>/dev/null || true
-cp "$STRATEGY_PATH"/*.md "$WORKSPACE_DIR/" 2>/dev/null || true
-cp "$STRATEGY_PATH"/*.json "$WORKSPACE_DIR/" 2>/dev/null || true
+# Copy skill with proper structure (skills/polar-strategy/config/, etc.)
+SKILL_NAME=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]')-strategy
+mkdir -p "$WORKSPACE_DIR/skills/$SKILL_NAME"
+cp -r "$STRATEGY_PATH"/* "$WORKSPACE_DIR/skills/$SKILL_NAME/" 2>/dev/null || true
+
+# Copy skill README to workspace root for reference
+cp "$STRATEGY_PATH/README.md" "$WORKSPACE_DIR/SKILL-README.md" 2>/dev/null || true
 
 # Copy shared plugins
 for plugin in dsl-dynamic-stop-loss fee-optimizer emerging-movers opportunity-scanner; do
@@ -387,6 +391,9 @@ if [[ ! -f "$SENPI_CONFIG/credentials.json" ]]; then
   exit 1
 fi
 
+# Set OpenClaw workspace so Senpi scripts find their skills/config
+export OPENCLAW_WORKSPACE="$AGENT_DIR"
+
 # Start OpenClaw agent
 cd "$AGENT_DIR"
 exec openclaw agent
@@ -411,6 +418,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$WORKSPACE_DIR
+Environment="OPENCLAW_WORKSPACE=$WORKSPACE_DIR"
 Environment="SENPI_AUTH_TOKEN=$(cat $SENPI_CREDS 2>/dev/null | jq -r '.apiKey')"
 ExecStart=$WORKSPACE_DIR/start.sh
 Restart=on-failure
