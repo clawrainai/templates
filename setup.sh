@@ -52,12 +52,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ─── Validate ──────────────────────────────────────────────────────────────
+# ─── Validate ID only ─────────────────────────────────────────────────────────
 [[ -z "$AGENT_ID" ]]   && { log_error "--agent-id required"; usage; }
-[[ -z "$STRATEGY" ]]  && { log_error "--strategy required (POLAR, FOX, ORCA...)"; usage; }
-
-STRATEGY_KEBAB=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]')
-STRATEGY_UPPER=$(echo "$STRATEGY" | tr '[:lower:]' '[:upper:]')
 
 # ─── Load config from CLAWRAIN_CONFIG (embedded JSON) ───────────────────────
 if [[ -z "$CLAWRAIN_CONFIG" ]]; then
@@ -75,12 +71,13 @@ PLATFORM_ENDPOINT=$(jq -r '.platform_endpoint // empty' "$CONFIG_PATH")
 SKILL_REPO=$(jq -r '.skill.repo // "https://github.com/Senpi-ai/senpi-skills"' "$CONFIG_PATH")
 SKILL_PATH=$(jq -r '.skill.path // empty' "$CONFIG_PATH")
 SKILL_BRANCH=$(jq -r '.skill.branch // "main"' "$CONFIG_PATH")
+STRATEGY="${STRATEGY:-$(basename "$SKILL_PATH")}"  # Use arg or derive from config
 
-# Override strategy from args
-if [[ -n "$SKILL_PATH" ]]; then
-  STRATEGY_KEBAB=$(basename "$SKILL_PATH" | tr '[:upper:]' '[:lower:]')
-  STRATEGY_UPPER=$(echo "$STRATEGY_KEBAB" | tr '[:lower:]' '[:upper:]')
-fi
+# Validate strategy
+[[ -z "$STRATEGY" ]] && { log_error "strategy not found in config or --strategy arg"; usage; }
+
+STRATEGY_KEBAB=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]')
+STRATEGY_UPPER=$(echo "$STRATEGY" | tr '[:lower:]' '[:upper:]')
 
 # ─── Workspace ─────────────────────────────────────────────────────────────
 WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace/hyperliquid/senpi/$STRATEGY_KEBAB}"
