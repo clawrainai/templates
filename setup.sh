@@ -368,12 +368,12 @@ cat > "$WORKSPACE_DIR/start.sh" << 'STARTSCRIPT'
 AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_NAME="$(basename "$AGENT_DIR")"
 
-# Load Senpi credentials for this strategy
+# Load Senpi credentials for this strategy (parse JSON with jq)
 SENPI_CONFIG="$AGENT_DIR/.config/senpi"
-source "$SENPI_CONFIG/credentials.json" 2>/dev/null || true
-
-export SENPI_AUTH_TOKEN="${apiKey:-}"
-export SENPI_API_KEY="${apiKey:-}"
+if [[ -f "$SENPI_CONFIG/credentials.json" ]]; then
+  export SENPI_AUTH_TOKEN="$(jq -r '.apiKey' "$SENPI_CONFIG/credentials.json" 2>/dev/null)"
+  export SENPI_API_KEY="$SENPI_AUTH_TOKEN"
+fi
 
 echo "========================================"
 echo "  ClawRain Agent: $AGENT_NAME"
