@@ -1,5 +1,8 @@
 #!/bin/bash
-# ClawRain Agent Setup Script — curl ...setup.sh | bash -s -- --agent-id ID
+# ClawRain Agent Setup Script v5
+# Usage:
+#   curl ...setup.sh | bash -s -- --agent-id ID    # from ClawRain Hub API
+#   curl ...setup.sh | bash -s -- --config FILE   # from downloaded config.json
 
 set -e
 
@@ -7,7 +10,12 @@ set -e
 SENPI_UPSTREAM="https://github.com/Senpi-ai/senpi-skills"
 TEMPLATES_REPO="https://github.com/clawrainai/templates"
 
-# ─── Usage ─────────────────────────────────────────────────────────────────
+# ─── Helpers ───────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
 usage() {
   echo "Usage:"
   echo "  curl ...setup.sh | bash -s -- --agent-id ID    # from ClawRain Hub API"
@@ -15,20 +23,14 @@ usage() {
   exit 1
 }
 
-# ─── Helpers ───────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
 # ─── Args ──────────────────────────────────────────────────────────────────
 AGENT_ID=""
 CONFIG_PATH=""
 WORKSPACE_DIR=""
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --agent-id)  AGENT_ID="$2"; shift 2 ;;
-    --config)    CONFIG_PATH="$2"; shift 2 ;;
+    --agent-id)   AGENT_ID="$2"; shift 2 ;;
+    --config)     CONFIG_PATH="$2"; shift 2 ;;
     --workspace)  WORKSPACE_DIR="$2"; shift 2 ;;
     --help)       usage ;;
     *)            log_error "Unknown: $1"; usage ;;
@@ -62,7 +64,7 @@ fi
 # ─── Validate deps ──────────────────────────────────────────────────────────
 command -v jq   &>/dev/null || { log_info "Installing jq..."; sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
 command -v git  &>/dev/null || { log_error "git required"; exit 1; }
-command -v npx  &>/dev/null || { log_error "npx (Node.js) required"; exit 1; }
+command -v node &>/dev/null || { log_error "node (Node.js) required"; exit 1; }
 
 # ─── Parse config ──────────────────────────────────────────────────────────
 [[ -z "$AGENT_ID" ]] && AGENT_ID=$(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")
@@ -72,25 +74,26 @@ MARKET=$(jq -r '.market // empty' "$CONFIG_PATH")
 SERVICE=$(jq -r '.service // "senpi"' "$CONFIG_PATH")
 STRATEGY=$(jq -r '.strategy // empty' "$CONFIG_PATH")
 IDENTITY_ADDRESS=$(jq -r '.identity.address // empty' "$CONFIG_PATH")
-SKILL_REPO=$(jq -r '.skill.repo // empty' "$CONFIG_PATH")
+SKILL_REPO=$(jq -r '.skill.repo // "https://github.com/Senpi-ai/senpi-skills"' "$CONFIG_PATH")
 SKILL_PATH=$(jq -r '.skill.path // empty' "$CONFIG_PATH")
 SKILL_BRANCH=$(jq -r '.skill.branch // "main"' "$CONFIG_PATH")
 PLATFORM_URL=$(jq -r '.platform_url // empty' "$CONFIG_PATH")
+PLATFORM_TOKEN=$(jq -r '.platform_token // empty' "$CONFIG_PATH")
+PLATFORM_ENDPOINT=$(jq -r '.platform_endpoint // empty' "$CONFIG_PATH")
 
-
-[[ -z "$MARKET"   ]] && { log_error "market missing in config"; exit 1; }
-[[ -z "$STRATEGY" ]] && { log_error "strategy missing in config"; exit 1; }
-
-STRATEGY_KEBAB=$(echo "$STRATEGY" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr '.' '-')
+[[ -z "$MARKET" ]]    && { log_error "market missing in config"; exit 1; }
+[[ -z "$STRATEGY" ]]  && { log_error "strategy missing in config"; exit 1; }
+[[ -z "$SKILL_PATH" ]] && { log_error "skill.path missing in config"; exit 1; }
 
 # ─── Workspace ─────────────────────────────────────────────────────────────
-WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
+WORKSPACE_DIR="${WORKSPACE_DIR:-$HOME/.openclaw/workspace-$AGENT_ID}"
 
-log_info "ClawRain Agent Setup v4"
+log_info "ClawRain Agent Setup v5"
 echo "========================================"
-echo "  Agent ID:   $(jq -r '.agent_id // .agentId // empty' "$CONFIG_PATH")"
+echo "  Agent ID:   $AGENT_ID"
 echo "  Market:     $MARKET"
 echo "  Strategy:   $STRATEGY"
+echo "  Skill path: $SKILL_PATH"
 echo "  Workspace:  $WORKSPACE_DIR"
 echo ""
 
@@ -110,84 +113,86 @@ log_info "Installing config..."
 cp "$CONFIG_PATH" "$WORKSPACE_DIR/setup-config.json"
 chmod 444 "$WORKSPACE_DIR/setup-config.json"
 
-# ─── STEP 2: Onboard Senpi FIRST — generates wallet + crons ─────────────────
-if [[ "$SERVICE" == "senpi" ]]; then
-  log_info "Running Senpi onboarding..."
-  log_info "This will generate the agent wallet and configure trading crons."
-  echo ""
-
-  if npx --yes senpi-onboard --config "$WORKSPACE_DIR/setup-config.json" 2>&1; then
-    log_info "Senpi onboarding complete!"
-  else
-    log_warn "Senpi onboarding failed — will retry on first boot"
-  fi
-fi
-
-# ─── STEP 3: Clone Senpi strategy ───────────────────────────────────────────
-log_info "Fetching strategy from Senpi upstream..."
-
-# Use sparse checkout to only fetch the strategy subdirectory
-SKILL_DIR="$WORKSPACE_DIR/senpi-skill"
-git clone --depth 1 --filter=blob:none --no-checkout "$SKILL_REPO" "$SKILL_DIR" 2>/dev/null || {
-  log_error "Failed to clone Senpi upstream"
+# ─── STEP 2: Clone senpi-skills (full repo for skills + onboard) ───────────
+SENPI_TMP="/tmp/senpi-skills-$AGENT_ID"
+log_info "Cloning Senpi skills repo..."
+git clone --depth 1 "$SENPI_UPSTREAM" "$SENPI_TMP" 2>/dev/null || {
+  log_error "Failed to clone $SENPI_UPSTREAM"
   exit 1
 }
 
-cd "$SKILL_DIR"
-git sparse-checkout init --cone
-git sparse-checkout set "$SKILL_PATH"
-git checkout main
-cd - > /dev/null
+# ─── STEP 3: Run senpi-onboard if service == senpi ──────────────────────────
+if [[ "$SERVICE" == "senpi" ]]; then
+  log_info "Running Senpi onboarding (wallet generation)..."
 
-STRATEGY_DIR="$SKILL_DIR/$SKILL_PATH"
+  ONBOARD_SCRIPT="$SENPI_TMP/senpi-onboard/scripts/generate_wallet.js"
+  if [[ -f "$ONBOARD_SCRIPT" ]]; then
+    if node "$ONBOARD_SCRIPT" --config "$WORKSPACE_DIR/setup-config.json" 2>&1; then
+      log_info "Senpi onboarding complete!"
+    else
+      log_warn "Senpi onboarding failed — will retry on first boot"
+    fi
+  else
+    log_warn "senpi-onboard script not found at $ONBOARD_SCRIPT"
+  fi
+fi
+
+# ─── STEP 4: Copy strategy skill ────────────────────────────────────────────
+log_info "Fetching strategy '$STRATEGY' from Senpi upstream..."
+
+STRATEGY_DIR="$SENPI_TMP/$SKILL_PATH"
 if [[ ! -d "$STRATEGY_DIR" ]]; then
-  log_error "Strategy not found: $SKILL_PATH"
+  log_error "Strategy not found at '$SKILL_PATH' in Senpi repo"
+  log_error "Available top-level items:"
+  ls "$SENPI_TMP" | grep -v "^\." | head -20
+  rm -rf "$SENPI_TMP"
   exit 1
 fi
 
-cp "$STRATEGY_DIR/config.json" "$WORKSPACE_DIR/strategy.json"
-cp -r "$STRATEGY_DIR/skills/"* "$WORKSPACE_DIR/skills/" 2>/dev/null || true
+cp "$STRATEGY_DIR/config.json" "$WORKSPACE_DIR/strategy.json" 2>/dev/null || {
+  log_warn "No config.json found in strategy"
+}
 
+# Copy skills from strategy
+if [[ -d "$STRATEGY_DIR/skills" ]]; then
+  cp -r "$STRATEGY_DIR/skills/"* "$WORKSPACE_DIR/skills/" 2>/dev/null || true
+fi
+
+# Copy memory template if exists
 MEMORY_TPL="$STRATEGY_DIR/memory/template.md"
 [[ -f "$MEMORY_TPL" ]] && cp "$MEMORY_TPL" "$WORKSPACE_DIR/memory/$(date +%Y-%m-%d).md"
 
-rm -rf "$SKILL_DIR"
+rm -rf "$SENPI_TMP"
 
-# ─── STEP 4: Inject clawrain-agent (metrics server) ────────────────────────────
+# ─── STEP 5: Inject clawrain-agent (metrics server) ─────────────────────────
 log_info "Injecting ClawRain infrastructure..."
 
-git clone --depth 1 --filter=blob:none --sparse "$TEMPLATES_REPO" \
-  "$WORKSPACE_DIR/templates" 2>/dev/null
+CLAWRAIN_TMP="/tmp/clawrain-templates-$AGENT_ID"
+git clone --depth 1 "$TEMPLATES_REPO" "$CLAWRAIN_TMP" 2>/dev/null || {
+  log_warn "Could not clone templates repo"
+}
 
-if git -C "$WORKSPACE_DIR/templates" sparse-checkout set base 2>/dev/null; then
-  : # ok
-else
-  git -C "$WORKSPACE_DIR/templates" sparse-checkout init 2>/dev/null
-  git -C "$WORKSPACE_DIR/templates" sparse-checkout set base 2>/dev/null
-fi
-
-if [[ -d "$WORKSPACE_DIR/templates/base/clawrain-agent" ]]; then
+if [[ -d "$CLAWRAIN_TMP/base/clawrain-agent" ]]; then
   mkdir -p "$WORKSPACE_DIR/clawrain-agent"
-  cp -r "$WORKSPACE_DIR/templates/base/clawrain-agent/"* "$WORKSPACE_DIR/clawrain-agent/"
+  cp -r "$CLAWRAIN_TMP/base/clawrain-agent/"* "$WORKSPACE_DIR/clawrain-agent/"
   log_info "clawrain-agent installed"
 fi
 
 # Copy base OpenClaw files
 for f in identity.md soul.md AGENTS.md; do
-  [[ -f "$WORKSPACE_DIR/templates/base/$f" ]] && cp "$WORKSPACE_DIR/templates/base/$f" "$WORKSPACE_DIR/"
+  [[ -f "$CLAWRAIN_TMP/base/$f" ]] && cp "$CLAWRAIN_TMP/base/$f" "$WORKSPACE_DIR/"
 done
 
-rm -rf "$WORKSPACE_DIR/templates"
+rm -rf "$CLAWRAIN_TMP"
 
-# ─── STEP 5: Cloudflare Tunnel ───────────────────────────────────────────────
+# ─── STEP 6: Cloudflare Tunnel ───────────────────────────────────────────────
 log_info "Setting up Cloudflare Tunnel..."
 
 if ! command -v cloudflared &>/dev/null; then
   ARCH=$(uname -m)
   case "$ARCH" in
     x86_64)  URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
-    arm64)   URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
-    aarch64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    arm64|aarch64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
     *)       URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
   esac
   curl -L "$URL" -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
@@ -200,52 +205,42 @@ echo "$TUNNEL_NAME" > "$HOME/.config/clawrain/tunnel_name"
 
 log_info "Tunnel ready: https://$TUNNEL_NAME.trycloudflare.com"
 
-# ─── STEP 6: Register with Supabase ───────────────────────────────────────
+# ─── STEP 7: Register with platform ─────────────────────────────────────────
 if [[ -n "$PLATFORM_TOKEN" && -n "$PLATFORM_ENDPOINT" ]]; then
   log_info "Registering agent with platform..."
   curl -s -X POST "$PLATFORM_ENDPOINT/rest/v1/agent_metrics" \
     -H "Authorization: Bearer $PLATFORM_TOKEN" \
     -H "Content-Type: application/json" \
+    -H "Prefer: return=minimal" \
     -d "{\"agent_id\":\"$AGENT_ID\",\"status\":\"provisioned\",\"equity\":0,\"pnl_total\":0}" \
     || log_warn "Could not register with platform"
 fi
 
-# ─── STEP 7: Install + start clawrain-agent ───────────────────────────────
+# ─── STEP 8: Install clawrain-agent ─────────────────────────────────────────
 if [[ -f "$WORKSPACE_DIR/clawrain-agent/clawrain_agent-0.1.0.tar.gz" ]]; then
   log_info "Installing clawrain-agent..."
 
-  # Install Python dependencies
   pip install fastapi uvicorn[standard] python-multipart aiofiles httpx \
     --quiet 2>/dev/null || true
 
-  # Install clawrain-agent from local tarball
   pip install "$WORKSPACE_DIR/clawrain-agent/clawrain_agent-0.1.0.tar.gz" \
     --quiet 2>/dev/null || {
-    log_warn "clawrain-agent install failed — trying from PyPI"
+    log_warn "clawrain-agent tarball install failed — trying PyPI"
     pip install clawrain-agent --quiet 2>/dev/null || true
   }
 
   if command -v clawrain-agent &>/dev/null; then
-    log_info "Starting clawrain-agent on port 8000..."
-    clawrain-agent init --config "$WORKSPACE_DIR/setup-config.json" 2>/dev/null || true
-    nohup clawrain-agent start --config "$WORKSPACE_DIR/setup-config.json" --port 8000 \
-      >> /tmp/clawrain-agent-$AGENT_ID.log 2>&1 &
-    echo $! > "$HOME/.config/clawrain/agent.pid"
-    log_info "clawrain-agent running (PID $(cat $HOME/.config/clawrain/agent.pid))"
-    log_info "Metrics API: http://localhost:8000"
+    log_info "clawrain-agent binary available"
   else
-    log_warn "clawrain-agent not available — metrics will not be served"
+    log_warn "clawrain-agent not in PATH — skipping metrics server"
   fi
 fi
 
-# ─── STEP 8: Create start script ───────────────────────────────────────────
-cat > "$WORKSPACE_DIR/start.sh" << 'START'
+# ─── STEP 9: Create start script ───────────────────────────────────────────
+cat > "$WORKSPACE_DIR/start.sh" << 'STARTSCRIPT'
 #!/bin/bash
 AGENT_DIR="$(dirname "$0")"
-SCRIPT
-echo "AGENT_ID=\"$AGENT_ID\"" >> "$WORKSPACE_DIR/start.sh"
-
-cat >> "$WORKSPACE_DIR/start.sh" << 'START'
+AGENT_ID="$(basename "$AGENT_DIR")"
 TUNNEL_NAME="$(cat $HOME/.config/clawrain/tunnel_name 2>/dev/null || echo "agent-$AGENT_ID")"
 
 # Cloudflare Tunnel
@@ -253,16 +248,16 @@ if command -v cloudflared &>/dev/null; then
   cloudflared tunnel run "$TUNNEL_NAME" &>/tmp/clawrain-tunnel-$AGENT_ID.log &
 fi
 
-# platform-push
-if [[ -f "$AGENT_DIR/skills/platform-push/platform-push.js" ]]; then
-  nohup node "$AGENT_DIR/skills/platform-push/platform-push.js" \
-    >> /tmp/clawrain-push-$AGENT_ID.log 2>&1 &
+# clawrain-agent
+if command -v clawrain-agent &>/dev/null && [[ -f "$AGENT_DIR/setup-config.json" ]]; then
+  nohup clawrain-agent start --config "$AGENT_DIR/setup-config.json" --port 8000 \
+    >> /tmp/clawrain-agent-$AGENT_ID.log 2>&1 &
 fi
 
 # OpenClaw agent
 cd "$AGENT_DIR"
 exec openclaw agent
-START
+STARTSCRIPT
 
 chmod +x "$WORKSPACE_DIR/start.sh"
 
@@ -270,12 +265,10 @@ chmod +x "$WORKSPACE_DIR/start.sh"
 echo ""
 log_info "✅ Setup complete!"
 echo ""
-echo "Files:"
-ls -la "$WORKSPACE_DIR"
+echo "  Workspace: $WORKSPACE_DIR"
+echo "  Start:    $WORKSPACE_DIR/start.sh"
 echo ""
 echo "Logs:"
-echo "  platform-push: tail -f /tmp/clawrain-push-$AGENT_ID.log"
-echo "  tunnel:       tail -f /tmp/clawrain-tunnel-$AGENT_ID.log"
-echo ""
-echo "To start: $WORKSPACE_DIR/start.sh"
+echo "  tail -f /tmp/clawrain-tunnel-\$(basename $WORKSPACE_DIR).log"
+[[ -f "/tmp/clawrain-agent-$AGENT_ID.log" ]] && echo "  tail -f /tmp/clawrain-agent-$AGENT_ID.log"
 echo ""
