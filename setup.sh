@@ -242,6 +242,59 @@ curl -s -X POST "${PLATFORM_URL}/api/agent/${AGENT_ID}/activate" \
 
 echo "[STEP 2/3] Skill + Infrastructure — DONE"
 
+# ─── STEP 2.5: Custom Strategy Creation (if applicable) ──────────────────
+CUSTOM_STRATEGY=$(jq -e '.customStrategy' setup-config.json 2>/dev/null)
+if [[ "$CUSTOM_STRATEGY" != "" ]] && [[ "$CUSTOM_STRATEGY" != "null" ]]; then
+  echo "[STEP 2.5/3] Creating custom strategy via Senpi MCP..."
+
+  SENPI_AUTH_TOKEN=$(jq -r '.apiKey' ~/.config/senpi/credentials.json)
+  SENPI_MCP_URL="https://mcp.prod.senpi.ai/mcp"
+
+  # Build the MCP request for strategy_create_custom_strategy
+  INITIAL_BUDGET=$(jq -r '.customStrategy.initialBudget // 100' setup-config.json)
+  STRATEGY_NAME=$(jq -r '.customStrategy.strategyName // "My Custom Strategy"' setup-config.json)
+  STOP_LOSS=$(jq -r '.customStrategy.stopLossPercentage // 0' setup-config.json)
+  TAKE_PROFIT=$(jq -r '.customStrategy.takeProfitPercentage // 0' setup-config.json)
+
+  # Build positions JSON array
+  POSITIONS_JSON=$(jq -r '.customStrategy.positions | @json' setup-config.json)
+
+  MCP_REQUEST=$(cat << MCPJSON
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"strategy_create_custom_strategy","arguments":{"initialBudget":$INITIAL_BUDGET,"strategyName":"$STRATEGY_NAME","stopLossPercentage":$STOP_LOSS,"takeProfitPercentage":$TAKE_PROFIT,"positions":$POSITIONS_JSON,"skillName":"autonomous-trading","skillVersion":"6.0"}}}
+MCPJSON
+)
+
+  echo "[INFO] Calling Senpi MCP: strategy_create_custom_strategy..."
+  MCP_RESPONSE=$(curl -s -X POST "$SENPI_MCP_URL" \
+    -H "Authorization: Bearer $SENPI_AUTH_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$MCP_REQUEST")
+
+  echo "[DEBUG] MCP Response: $MCP_RESPONSE"
+
+  # Parse strategy_id from response
+  STRATEGY_ID=$(echo "$MCP_RESPONSE" | jq -r '.result // .error // empty')
+  if [[ -z "$STRATEGY_ID" ]] || [[ "$STRATEGY_ID" == "null" ]]; then
+    echo "[ERROR] Failed to create custom strategy"
+    echo "$MCP_RESPONSE"
+    exit 1
+  fi
+
+  echo "[INFO] Custom strategy created: $STRATEGY_ID"
+
+  # Save strategy_id for later use
+  mkdir -p "$WORKSPACE_DIR/.config/senpi"
+  echo "{"strategyId": "$STRATEGY_ID", "createdAt": "$(date -I)"}" > "$WORKSPACE_DIR/.config/senpi/strategy.json"
+
+  # Notify platform
+  curl -s -X POST "${PLATFORM_URL}/api/agent/${AGENT_ID}/strategy" \
+    -H "Authorization: Bearer ${API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"strategy_id\": \"$STRATEGY_ID\", \"custom\": true}" > /dev/null || true
+
+  echo "[STEP 2.5/3] Custom Strategy Created — DONE"
+fi
+
 # ─── STEP 3: Strategy Configuration + Crons ───────────────────────────────
 echo "[STEP 3/3] Setting up crons..."
 
