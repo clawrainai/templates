@@ -8,73 +8,108 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-SKILL_PATH=$(jq -r '.skill.path' "$CONFIG")
-STRATEGY=$(basename "$SKILL_PATH")
 AGENT_ID=$(jq -r '.agent_id' "$CONFIG")
+WORKSPACE_DIR="$HOME/.clawrain/$AGENT_ID"
 
-echo "[INFO] Setting up crons for $STRATEGY..."
+# Check if custom strategy
+CUSTOM_STRATEGY=$(jq -e '.customStrategy' "$CONFIG" 2>/dev/null)
+STRATEGY_ID=""
+if [[ -f "$WORKSPACE_DIR/.config/senpi/strategy.json" ]]; then
+  STRATEGY_ID=$(jq -r '.strategyId' "$WORKSPACE_DIR/.config/senpi/strategy.json" 2>/dev/null)
+fi
 
-# Create cron wrapper that runs the scanner
-CRON_SCRIPT="/tmp/clawrain-cron-${AGENT_ID}.sh"
-cat > "$CRON_SCRIPT" << 'CRONEOF'
+echo "[INFO] Setting up crons..."
+
+# Determine strategy identifier for cron name
+if [[ -n "$STRATEGY_ID" ]]; then
+  CRON_NAME="clawrain-custom-${AGENT_ID:0:8}"
+  echo "[INFO] Custom strategy detected: $STRATEGY_ID"
+else
+  SKILL_PATH=$(jq -r '.skill.path' "$CONFIG")
+  CRON_NAME="clawrain-$(basename "$SKILL_PATH")-${AGENT_ID:0:8}"
+fi
+
+# Create cron wrapper
+CRON_SCRIPT="/tmp/clawrain-cron-${AGENT_ID:0:8}.sh"
+
+if [[ -n "$STRATEGY_ID" ]]; then
+  # Custom strategy cron - uses Senpi MCP
+  cat > "$CRON_SCRIPT" << 'CRONEOF'
 #!/bin/bash
-# Cron wrapper for ClawRain trading agent
-AGENT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILL_DIR="$AGENT_DIR/skills/STRATEGY_PLACEHOLDER"
+# Cron wrapper for ClawRain custom strategy
+AGENT_DIR="$HOME/.clawrain/AGENT_ID_PLACEHOLDER"
+export OPENCLAW_WORKSPACE="$AGENT_DIR"
+
+# Load Senpi credentials
+SENPI_CREDS="$AGENT_DIR/.config/senpi/credentials.json"
+STRATEGY_JSON="$AGENT_DIR/.config/senpi/strategy.json"
+
+if [[ ! -f "$SENPI_CREDS" ]] || [[ ! -f "$STRATEGY_JSON" ]]; then
+  exit 0
+fi
+
+SENPI_AUTH_TOKEN=$(jq -r '.apiKey' "$SENPI_CREDS")
+STRATEGY_ID=$(jq -r '.strategyId' "$STRATEGY_JSON")
+SENPI_MCP_URL="https://mcp.prod.senpi.ai/mcp"
+
+# Call Senpi MCP to check strategy status and execute
+MCP_REQUEST=$(cat << MCPJSON
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"strategy_get_status","arguments":{"strategyId":"$STRATEGY_ID"}}}
+MCPJSON
+)
+
+curl -s -X POST "$SENPI_MCP_URL" \
+  -H "Authorization: Bearer $SENPI_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "$MCP_REQUEST" > /dev/null 2>&1
+
+echo "[$(date)] Custom strategy $STRATEGY_ID checked"
+CRONEOF
+
+  sed -i "s|AGENT_ID_PLACEHOLDER|$AGENT_ID|g" "$CRON_SCRIPT"
+
+else
+  # Catalog strategy cron - uses Python scanner
+  SKILL_PATH=$(jq -r '.skill.path' "$CONFIG")
+  STRATEGY=$(basename "$SKILL_PATH")
+
+  cat > "$CRON_SCRIPT" << CRONEOF
+#!/bin/bash
+AGENT_DIR="$HOME/.clawrain/$AGENT_ID"
+SKILL_DIR="$AGENT_DIR/skills/$STRATEGY"
 export OPENCLAW_WORKSPACE="$AGENT_DIR"
 export PYTHONPATH="$SKILL_DIR/scripts:$PYTHONPATH"
 cd "$SKILL_DIR"
 python3 scripts/*-scanner.py 2>&1
 CRONEOF
 
-# Replace placeholder
-sed -i "s/STRATEGY_PLACEHOLDER/$STRATEGY/g" "$CRON_SCRIPT"
+fi
+
 chmod +x "$CRON_SCRIPT"
 
-# Check if openclaw cron is available
-if command -v openclaw &>/dev/null; then
-  echo "[INFO] Creating OpenClaw cron for $STRATEGY..."
-  
-  # Run every 3 minutes
-  openclaw cron add \
-    --name "clawrain-$STRATEGY" \
-    --schedule "*/3 * * * *" \
-    --command "bash $CRON_SCRIPT" \
-    2>/dev/null || {
-    echo "[WARN] Failed to create OpenClaw cron, using systemd timer instead"
-    create_systemd_timer
-  }
-else
-  echo "[INFO] OpenClaw not available, using systemd timer..."
-  create_systemd_timer
-fi
+# Install cron via systemd timer (more reliable than cron on VPS)
+UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$UNIT_DIR"
 
-echo "[DONE] Crons configured for $STRATEGY"
+# Stop existing timer if any
+systemctl --user stop "clawrain-${CRON_NAME}.timer" 2>/dev/null || true
 
-# Verify cron
-if command -v openclaw &>/dev/null; then
-  openclaw cron list 2>/dev/null | grep -i "clawrain" || true
-fi
-
-create_systemd_timer() {
-  UNIT_DIR="$HOME/.config/systemd/user"
-  mkdir -p "$UNIT_DIR"
-  
-  # Service
-  cat > "$UNIT_DIR/clawrain-$STRATEGY.service" << EOF
+# Service
+cat > "$UNIT_DIR/clawrain-${CRON_NAME}.service" << EOF
 [Unit]
-Description=ClawRain $STRATEGY Scanner
+Description=ClawRain ${CRON_NAME} Scanner
 [Service]
 Type=oneshot
 ExecStart=$CRON_SCRIPT
-WorkingDirectory=$HOME/.clawrain/$AGENT_ID
-Environment=OPENCLAW_WORKSPACE=$HOME/.clawrain/$AGENT_ID
+WorkingDirectory=$WORKSPACE_DIR
+Environment=OPENCLAW_WORKSPACE=$WORKSPACE_DIR
+Environment=HOME=$HOME
 EOF
 
-  # Timer (every 3 minutes)
-  cat > "$UNIT_DIR/clawrain-$STRATEGY.timer" << EOF
+# Timer (every 3 minutes)
+cat > "$UNIT_DIR/clawrain-${CRON_NAME}.timer" << EOF
 [Unit]
-Description=ClawRain $STRATEGY Scanner Timer
+Description=ClawRain ${CRON_NAME} Scanner Timer
 [Timer]
 OnBootSec=30
 OnUnitActiveSec=180
@@ -83,7 +118,8 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-  systemctl --user daemon-reload 2>/dev/null || true
-  systemctl --user enable --now clawrain-$STRATEGY.timer 2>/dev/null || true
-  echo "[INFO] Systemd timer created for $STRATEGY"
-}
+systemctl --user daemon-reload 2>/dev/null || true
+systemctl --user enable --now "clawrain-${CRON_NAME}.timer" 2>/dev/null || true
+
+echo "[DONE] Crons configured: $CRON_NAME"
+echo "[INFO] Timer: every 3 minutes"
